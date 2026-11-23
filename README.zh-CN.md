@@ -128,7 +128,7 @@ curl --proxy-insecure -x https://USER:PASS@HOST:PORT https://example.com  # 到�
   - `CONNECT` 和 SOCKS5 隧道里是客户端自己与站点的加密会话，无法给其他客户端复用；隧道由客户端在内部复用，代理不设空闲超时。
 - **IPv4 和 IPv6**：v4、v6 分别监听（v6 套接字设置 `IPV6_V6ONLY`），能准确拿到客户端连入的本机地址
 - **单用户认证**：HTTP Basic 与 SOCKS5 共用一组用户名和密码；两者都留空表示不认证
-- **开机自启动**：服务模式下，Linux 用 systemd，macOS 用 launchd
+- **开机自启动**：服务模式下，Linux 用 systemd，macOS 用 launchd，Windows 用服务管理器
 - **性能**：
   - tokio 多线程运行时
   - 普通 HTTP 转发复用源站连接，省去重复的 DNS 查询和 TCP 握手

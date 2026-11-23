@@ -128,7 +128,7 @@ The end of `proxy-tui --help` contains a complete usage guide (options, proxy UR
   - `CONNECT` and SOCKS5 tunnels carry the client's own encrypted session with the site, so they cannot be shared with other clients. Clients reuse their tunnels internally, and the proxy puts no idle limit on them.
 - **IPv4 and IPv6**: separate v4 and v6 listeners (`IPV6_V6ONLY` on the v6 socket), so the local address a client connected to is always known exactly.
 - **Single-user authentication**: HTTP Basic and SOCKS5 share one username and password; leaving both empty disables authentication.
-- **Start at boot**: in service mode, via systemd on Linux and launchd on macOS.
+- **Start at boot**: in service mode, via systemd on Linux, launchd on macOS and the service manager on Windows.
 - **Performance**:
   - tokio multi-threaded runtime
   - plain HTTP forwarding reuses origin connections, saving repeated DNS lookups and TCP handshakes
