@@ -33,14 +33,13 @@ pub async fn serve(path: PathBuf, ctx: Arc<Ctx>) -> Result<JoinHandle<()>> {
         }
         let _ = dir.remove(name);
     }
-    // Create the socket private from the start instead of chmod-ing it by path.
-    let old_mask = unsafe { libc::umask(0o177) };
-    let bound = UnixListener::bind(&path);
-    unsafe { libc::umask(old_mask) };
-    let listener = bound.with_context(|| format!("绑定 {}", path.display()))?;
     // A root service hands the socket to the data dir's owner, so that user's
     // TUI can manage it without sudo.
-    dir.give_entry(name)?;
+    let listener = dir
+        .bind_socket(name)
+        .and_then(|l| l.set_nonblocking(true).map(|_| l))
+        .with_context(|| format!("绑定 {}", path.display()))?;
+    let listener = UnixListener::from_std(listener)?;
     Ok(tokio::spawn(async move {
         loop {
             match listener.accept().await {

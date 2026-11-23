@@ -135,11 +135,6 @@ impl SafeDir {
     pub fn remove(&self, name: &str) -> io::Result<()> {
         std::fs::remove_file(self.entry(name)?)
     }
-
-    /// Files inherit the directory's ACL; there is no owner to hand over.
-    pub fn give_entry(&self, _name: &str) -> io::Result<()> {
-        Ok(())
-    }
 }
 
 /// Opens a file for reading without blocking its rotation or replacement.

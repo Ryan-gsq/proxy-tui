@@ -9,6 +9,7 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::net::UnixListener;
 use std::path::{Component, Path, PathBuf};
 
 use crate::config::is_root;
@@ -323,23 +324,44 @@ impl SafeDir {
         cvt(unsafe { libc::unlinkat(self.raw(), c.as_ptr(), 0) }).map(|_| ())
     }
 
-    /// Hands an entry created by path (e.g. a bound socket) to the directory's
-    /// owner without following a symlink.
-    pub fn give_entry(&self, name: &str) -> io::Result<()> {
-        if !is_root() {
-            return Ok(());
-        }
-        let c = cname(OsStr::new(name))?;
-        cvt(unsafe {
-            libc::fchownat(
-                self.raw(),
-                c.as_ptr(),
-                self.uid,
-                self.gid,
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        })
-        .map(|_| ())
+    /// Binds a Unix socket as `name` that is private (0600, the directory's
+    /// owner) from the moment it appears: it is bound in a fresh 0700 directory,
+    /// fixed up there and hard-linked in. Fails if `name` already exists.
+    pub fn bind_socket(&self, name: &str) -> io::Result<UnixListener> {
+        let target = cname(OsStr::new(name))?;
+        let stage_name = format!(".sock-{:08x}", rand::random::<u32>());
+        let stage = cname(OsStr::new(&stage_name))?;
+        cvt(unsafe { libc::mkdirat(self.raw(), stage.as_ptr(), 0o700) })?;
+        let dir_flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW;
+        let result = openat(self.raw(), &stage, dir_flags, 0).and_then(|stage_fd| {
+            let listener = UnixListener::bind(self.path.join(&stage_name).join(name))?;
+            let staged = stage_fd.as_raw_fd();
+            let placed = (|| {
+                cvt(unsafe { libc::fchmodat(staged, target.as_ptr(), 0o600, 0) })?;
+                if is_root() {
+                    cvt(unsafe {
+                        libc::fchownat(
+                            staged,
+                            target.as_ptr(),
+                            self.uid,
+                            self.gid,
+                            libc::AT_SYMLINK_NOFOLLOW,
+                        )
+                    })?;
+                }
+                cvt(unsafe {
+                    libc::linkat(staged, target.as_ptr(), self.raw(), target.as_ptr(), 0)
+                })
+                .map_err(|e| match e.raw_os_error() {
+                    Some(libc::EEXIST) => io::Error::from_raw_os_error(libc::EADDRINUSE),
+                    _ => e,
+                })
+            })();
+            unsafe { libc::unlinkat(staged, target.as_ptr(), 0) };
+            placed.map(|_| listener)
+        });
+        unsafe { libc::unlinkat(self.raw(), stage.as_ptr(), libc::AT_REMOVEDIR) };
+        result
     }
 }
 
@@ -391,6 +413,24 @@ mod tests {
         dir.write_atomic("config.toml", b"new", 0o600).unwrap();
         assert_eq!(std::fs::read(root.join("secret")).unwrap(), b"top secret");
         assert_eq!(dir.read("config.toml", 100).unwrap(), b"new");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn binds_a_private_socket_in_place() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixStream;
+        let root = scratch("sock");
+        let dir = SafeDir::create(&root).unwrap();
+        let listener = dir.bind_socket("s").unwrap();
+        let meta = std::fs::symlink_metadata(root.join("s")).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        UnixStream::connect(root.join("s")).unwrap();
+        listener.accept().unwrap();
+        let taken = dir.bind_socket("s").unwrap_err();
+        assert_eq!(taken.raw_os_error(), Some(libc::EADDRINUSE));
+        let entries = std::fs::read_dir(&root).unwrap().count();
+        assert_eq!(entries, 1, "staging directories are removed");
         let _ = std::fs::remove_dir_all(&root);
     }
 }
