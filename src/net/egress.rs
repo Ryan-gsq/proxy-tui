@@ -1,7 +1,10 @@
 use std::fmt;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::os::fd::AsFd;
+#[cfg(unix)]
+use std::os::fd::AsFd as AsSocket;
+#[cfg(windows)]
+use std::os::windows::io::AsSocket;
 use std::time::Duration;
 
 use socket2::{Domain, Protocol, SockRef, Type};
@@ -416,7 +419,7 @@ pub fn bound_udp(fam: Fam, eg: &Egress) -> io::Result<UdpSocket> {
     UdpSocket::from_std(sock.into())
 }
 
-fn prepare<S: AsFd>(
+fn prepare<S: AsSocket>(
     sock: &S,
     fam: Fam,
     iface: Option<&str>,
@@ -459,7 +462,38 @@ fn bind_device(sref: &SockRef<'_>, fam: Fam, _name: &str, index: u32) -> io::Res
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios")))]
+/// IP_UNICAST_IF / IPV6_UNICAST_IF. The source address alone already pins the
+/// interface under Windows' default strong host model; this makes it explicit.
+#[cfg(windows)]
+fn bind_device(sref: &SockRef<'_>, fam: Fam, _name: &str, index: u32) -> io::Result<()> {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{
+        setsockopt, IPPROTO_IP, IPPROTO_IPV6, IPV6_UNICAST_IF, IP_UNICAST_IF, SOCKET_ERROR,
+    };
+    if index == 0 {
+        return Ok(());
+    }
+    // IPv4 takes the index in network byte order, IPv6 in host byte order.
+    let (level, name, value) = match fam {
+        Fam::V4 => (IPPROTO_IP, IP_UNICAST_IF, index.to_be()),
+        Fam::V6 => (IPPROTO_IPV6, IPV6_UNICAST_IF, index),
+    };
+    let ret = unsafe {
+        setsockopt(
+            sref.as_raw_socket() as usize,
+            level,
+            name,
+            (&value as *const u32).cast(),
+            std::mem::size_of::<u32>() as i32,
+        )
+    };
+    if ret == SOCKET_ERROR {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios", windows)))]
 fn bind_device(_sref: &SockRef<'_>, _fam: Fam, _name: &str, _index: u32) -> io::Result<()> {
     Ok(())
 }

@@ -1,4 +1,5 @@
-//! Boot-time service management: systemd on Linux, launchd on macOS.
+//! Boot-time service management: systemd on Linux, launchd on macOS, the
+//! service control manager (SCM) on Windows.
 //! Every function returns text instead of printing so the TUI can call it.
 
 use std::path::{Path, PathBuf};
@@ -8,10 +9,26 @@ use anyhow::{bail, Context, Result};
 
 use serde::Serialize;
 
-use crate::config::{config_file, is_root, set_mode, Config, SafeDir};
+use crate::config::{admin_name, config_file, elevate_hint, is_root, set_mode, Config, SafeDir};
 use crate::tr;
 
+#[cfg(unix)]
 pub const BIN_PATH: &str = "/usr/local/bin/proxy-tui";
+
+#[cfg(windows)]
+pub use platform::run_service;
+
+/// Where `service install` puts the program.
+pub fn bin_path() -> PathBuf {
+    #[cfg(unix)]
+    return PathBuf::from(BIN_PATH);
+    #[cfg(windows)]
+    return std::env::var_os("ProgramFiles")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"))
+        .join("proxy-tui")
+        .join("proxy-tui.exe");
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -112,7 +129,11 @@ pub fn availability(action: Action, s: &ServiceStatus) -> Result<(), &'static st
         return Err(tr!("not supported on this system", "当前系统不支持"));
     }
     if !is_root() {
-        return Err(tr!("needs root", "需要 root"));
+        return Err(if cfg!(windows) {
+            tr!("needs Administrator", "需要管理员")
+        } else {
+            tr!("needs root", "需要 root")
+        });
     }
     match action {
         Action::Start | Action::Stop | Action::Restart | Action::Uninstall if !s.installed => {
@@ -154,9 +175,10 @@ pub fn status() -> ServiceStatus {
 /// Runs a service action for the data directory `dir`; requires root.
 pub fn perform(action: Action, dir: &Path) -> Result<String> {
     if !is_root() {
+        let (admin, hint) = (admin_name(), elevate_hint());
         bail!(tr!(
-            "service actions need root: run with sudo",
-            "服务操作需要 root 权限：请用 sudo 运行"
+            format!("service actions need {admin}: {hint}"),
+            format!("服务操作需要 {admin} 权限：{hint}")
         ));
     }
     match action {
@@ -193,10 +215,11 @@ fn run(program: &str, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Copies the running executable to BIN_PATH. Returns true when it copied.
+/// Copies the running executable to `bin_path()`. Returns true when it copied.
 fn install_binary() -> Result<bool> {
     let exe = std::env::current_exe()?.canonicalize()?;
-    let bin = Path::new(BIN_PATH);
+    let bin = bin_path();
+    let bin = bin.as_path();
     if bin.exists() && bin.canonicalize()? == exe {
         return Ok(false);
     }
@@ -234,6 +257,9 @@ fn install(dir: &Path) -> Result<String> {
             format!("数据目录路径必须是不含换行的 UTF-8：{}", dir.display())
         ));
     };
+    // Windows cannot replace the program while the service runs it.
+    #[cfg(windows)]
+    platform::stop_for_update()?;
     let copied = install_binary()?;
     let config_path = config_file(dir);
     let (cfg, created) = Config::load_or_create(&config_path)?;
@@ -251,10 +277,9 @@ fn install(dir: &Path) -> Result<String> {
         format!("已安装并启动（{manager}，开机自启）；数据目录 {dir}")
     );
     if copied {
-        msg.push_str(&tr!(
-            format!("; program {BIN_PATH}"),
-            format!("；程序 {BIN_PATH}")
-        ));
+        let bin = bin_path();
+        let bin = bin.display();
+        msg.push_str(&tr!(format!("; program {bin}"), format!("；程序 {bin}")));
     }
     if created {
         let (port, user, pass) = (cfg.listen.port, &cfg.auth.username, &cfg.auth.password);
@@ -268,17 +293,78 @@ fn install(dir: &Path) -> Result<String> {
 
 fn uninstall(dir: &Path) -> Result<String> {
     platform::uninstall()?;
-    let dir = dir.display();
+    let (dir, bin) = (dir.display(), bin_path());
+    let bin = bin.display();
     Ok(tr!(
-        format!("Service uninstalled; data directory {dir} and program {BIN_PATH} are kept"),
-        format!("服务已卸载；数据目录 {dir} 和程序 {BIN_PATH} 保留")
+        format!("Service uninstalled; data directory {dir} and program {bin} are kept"),
+        format!("服务已卸载；数据目录 {dir} 和程序 {bin} 保留")
     ))
 }
 
-/// Data directory used by the installed service (parsed from its unit / plist).
+/// Data directory used by the installed service (from its unit / plist, or on
+/// Windows its command line).
 pub fn installed_data_dir() -> Option<PathBuf> {
-    let text = std::fs::read_to_string(platform::UNIT_PATH).ok()?;
-    parse_dir_arg(&text).map(PathBuf::from)
+    #[cfg(unix)]
+    {
+        let text = std::fs::read_to_string(platform::UNIT_PATH).ok()?;
+        parse_dir_arg(&text).map(PathBuf::from)
+    }
+    #[cfg(windows)]
+    {
+        let args = windows_args(&platform::command_line()?);
+        let pos = args.iter().position(|a| a == "--dir")?;
+        args.get(pos + 1).map(PathBuf::from)
+    }
+}
+
+/// Splits a Windows command line by the MSVCRT rules the service's command line
+/// was quoted with: quotes group, `\"` is a quote, other backslashes are literal.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_args(line: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut arg = String::new();
+    let mut started = false;
+    let mut quoted = false;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                let mut slashes = 1;
+                while chars.peek() == Some(&'\\') {
+                    chars.next();
+                    slashes += 1;
+                }
+                if chars.peek() == Some(&'"') {
+                    arg.extend(std::iter::repeat_n('\\', slashes / 2));
+                    if slashes % 2 == 1 {
+                        arg.push('"');
+                        chars.next();
+                    }
+                } else {
+                    arg.extend(std::iter::repeat_n('\\', slashes));
+                }
+                started = true;
+            }
+            '"' => {
+                quoted = !quoted;
+                started = true;
+            }
+            c if c.is_whitespace() && !quoted => {
+                if started {
+                    args.push(std::mem::take(&mut arg));
+                    started = false;
+                }
+            }
+            c => {
+                arg.push(c);
+                started = true;
+            }
+        }
+    }
+    if started {
+        args.push(arg);
+    }
+    args
 }
 
 /// A systemd ExecStart argument: double-quoted, with `\` `"` escaped and `%`
@@ -308,6 +394,7 @@ fn xml_escape(text: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 fn xml_unescape(text: &str) -> String {
     text.replace("&lt;", "<")
         .replace("&gt;", ">")
@@ -317,6 +404,7 @@ fn xml_unescape(text: &str) -> String {
 }
 
 /// Splits an ExecStart command line into arguments (inverse of `systemd_quote`).
+#[cfg_attr(windows, allow(dead_code))]
 fn systemd_args(line: &str) -> Vec<String> {
     let mut args = Vec::new();
     let mut chars = line.chars().peekable();
@@ -352,6 +440,7 @@ fn systemd_args(line: &str) -> Vec<String> {
 
 /// Finds the value after `--dir` in a systemd ExecStart line or a plist
 /// ProgramArguments array.
+#[cfg_attr(windows, allow(dead_code))]
 fn parse_dir_arg(text: &str) -> Option<String> {
     if let Some(line) = text
         .lines()
@@ -678,7 +767,297 @@ mod platform {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(windows)]
+mod platform {
+    use super::*;
+    use std::ffi::{OsStr, OsString};
+    use std::sync::{Arc, OnceLock};
+    use std::time::{Duration, Instant};
+
+    use windows_service::service::{
+        Service, ServiceAccess, ServiceAction, ServiceActionType, ServiceControl,
+        ServiceControlAccept, ServiceErrorControl, ServiceExitCode, ServiceFailureActions,
+        ServiceFailureResetPeriod, ServiceInfo, ServiceStartType, ServiceState,
+        ServiceStatus as ScmStatus, ServiceType,
+    };
+    use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+    use crate::api::RunMode;
+
+    pub const MANAGER: &str = "SCM";
+    pub const UNIT_PATH: &str = r"HKLM\SYSTEM\CurrentControlSet\Services\proxy-tui";
+    const NAME: &str = "proxy-tui";
+    const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
+    const STATE_TIMEOUT: Duration = Duration::from_secs(20);
+
+    fn os_code(e: &windows_service::Error) -> Option<i32> {
+        match e {
+            windows_service::Error::Winapi(io) => io.raw_os_error(),
+            _ => None,
+        }
+    }
+
+    fn manager(access: ServiceManagerAccess) -> Result<ServiceManager> {
+        Ok(ServiceManager::local_computer(None::<&str>, access)?)
+    }
+
+    /// The installed service, or `None` when there is none.
+    fn open(access: ServiceAccess) -> Result<Option<Service>> {
+        match manager(ServiceManagerAccess::CONNECT)?.open_service(NAME, access) {
+            Ok(service) => Ok(Some(service)),
+            Err(e) if os_code(&e) == Some(ERROR_SERVICE_DOES_NOT_EXIST) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn installed(access: ServiceAccess) -> Result<Service> {
+        open(access)?
+            .ok_or_else(|| anyhow::anyhow!(tr!("the service is not installed", "服务未安装")))
+    }
+
+    fn state_of(status: &ScmStatus) -> RunState {
+        match status.current_state {
+            ServiceState::Running => RunState::Running,
+            ServiceState::Stopped if status.exit_code != ServiceExitCode::Win32(0) => {
+                RunState::Failed
+            }
+            ServiceState::Stopped => RunState::Stopped,
+            ServiceState::StartPending => RunState::Busy(tr!("starting", "启动中").into()),
+            ServiceState::StopPending => RunState::Busy(tr!("stopping", "停止中").into()),
+            other => RunState::Busy(format!("{other:?}")),
+        }
+    }
+
+    pub fn status() -> ServiceStatus {
+        let base = ServiceStatus {
+            manager: MANAGER,
+            supported: true,
+            installed: false,
+            enabled: false,
+            state: RunState::Stopped,
+            pid: None,
+            unit_path: UNIT_PATH,
+            note: String::new(),
+        };
+        let service = match open(ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG) {
+            Ok(Some(service)) => service,
+            Ok(None) => return base,
+            Err(e) => return ServiceStatus::unsupported(format!("{e:#}")),
+        };
+        let (state, pid) = match service.query_status() {
+            Ok(status) => (state_of(&status), status.process_id.filter(|p| *p != 0)),
+            Err(_) => (RunState::Unknown, None),
+        };
+        let enabled = service
+            .query_config()
+            .is_ok_and(|c| c.start_type == ServiceStartType::AutoStart);
+        ServiceStatus {
+            installed: true,
+            enabled,
+            state,
+            pid,
+            ..base
+        }
+    }
+
+    /// The installed service's command line.
+    pub fn command_line() -> Option<String> {
+        let service = open(ServiceAccess::QUERY_CONFIG).ok()??;
+        let config = service.query_config().ok()?;
+        Some(config.executable_path.to_string_lossy().into_owned())
+    }
+
+    fn wait_for(service: &Service, done: impl Fn(&ScmStatus) -> bool) -> Result<ScmStatus> {
+        let deadline = Instant::now() + STATE_TIMEOUT;
+        loop {
+            let status = service.query_status()?;
+            if done(&status) || Instant::now() >= deadline {
+                return Ok(status);
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    fn stop_and_wait(service: &Service) -> Result<()> {
+        if service.query_status()?.current_state == ServiceState::Stopped {
+            return Ok(());
+        }
+        let _ = service.stop();
+        let status = wait_for(service, |s| s.current_state == ServiceState::Stopped)?;
+        if status.current_state != ServiceState::Stopped {
+            bail!(tr!("the service did not stop in time", "服务未能及时停止"));
+        }
+        Ok(())
+    }
+
+    fn start_and_wait(service: &Service) -> Result<()> {
+        service.start(&[] as &[&OsStr])?;
+        let status = wait_for(service, |s| s.current_state != ServiceState::StartPending)?;
+        if status.current_state != ServiceState::Running {
+            bail!(tr!(
+                "the service did not start; see the log in the data directory",
+                "服务未能启动，请查看数据目录中的日志"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Stops a running service so its program file can be replaced.
+    pub fn stop_for_update() -> Result<()> {
+        match open(ServiceAccess::QUERY_STATUS | ServiceAccess::STOP)? {
+            Some(service) => stop_and_wait(&service),
+            None => Ok(()),
+        }
+    }
+
+    pub fn install(dir: &str) -> Result<()> {
+        let info = ServiceInfo {
+            name: NAME.into(),
+            display_name: NAME.into(),
+            service_type: ServiceType::OWN_PROCESS,
+            start_type: ServiceStartType::AutoStart,
+            error_control: ServiceErrorControl::Normal,
+            executable_path: bin_path(),
+            launch_arguments: ["daemon", "--dir", dir, "--service"]
+                .into_iter()
+                .map(OsString::from)
+                .collect(),
+            dependencies: Vec::new(),
+            account_name: None,
+            account_password: None,
+        };
+        let access = ServiceAccess::QUERY_STATUS
+            | ServiceAccess::START
+            | ServiceAccess::STOP
+            | ServiceAccess::CHANGE_CONFIG;
+        let service = match open(access)? {
+            Some(service) => {
+                service.change_config(&info)?;
+                service
+            }
+            None => manager(ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)?
+                .create_service(&info, access)?,
+        };
+        service.set_description("proxy-tui mixed HTTP/HTTPS/SOCKS5 proxy")?;
+        // Restart after a crash, like systemd's Restart=always.
+        let restart = ServiceAction {
+            action_type: ServiceActionType::Restart,
+            delay: Duration::from_secs(2),
+        };
+        service.update_failure_actions(ServiceFailureActions {
+            reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(86_400)),
+            reboot_msg: None,
+            command: None,
+            actions: Some(vec![restart.clone(), restart.clone(), restart]),
+        })?;
+        stop_and_wait(&service)?;
+        start_and_wait(&service)
+    }
+
+    pub fn uninstall() -> Result<()> {
+        let Some(service) =
+            open(ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE)?
+        else {
+            return Ok(());
+        };
+        stop_and_wait(&service)?;
+        service.delete()?;
+        Ok(())
+    }
+
+    pub fn start() -> Result<String> {
+        start_and_wait(&installed(
+            ServiceAccess::QUERY_STATUS | ServiceAccess::START,
+        )?)?;
+        Ok(tr!("Service started", "服务已启动").into())
+    }
+
+    pub fn stop() -> Result<String> {
+        stop_and_wait(&installed(
+            ServiceAccess::QUERY_STATUS | ServiceAccess::STOP,
+        )?)?;
+        Ok(tr!(
+            "Service stopped (it still starts at boot)",
+            "服务已停止（开机仍会自启）"
+        )
+        .into())
+    }
+
+    pub fn restart() -> Result<String> {
+        let service =
+            installed(ServiceAccess::QUERY_STATUS | ServiceAccess::START | ServiceAccess::STOP)?;
+        stop_and_wait(&service)?;
+        start_and_wait(&service)?;
+        Ok(tr!("Service restarted", "服务已重启").into())
+    }
+
+    static SERVICE_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+    windows_service::define_windows_service!(ffi_service_main, service_main);
+
+    /// Entry point of the process the SCM starts (`daemon --service`): hands the
+    /// thread to the dispatcher, which calls `service_main`.
+    pub fn run_service(dir: PathBuf) -> Result<()> {
+        let _ = SERVICE_DIR.set(dir);
+        windows_service::service_dispatcher::start(NAME, ffi_service_main)?;
+        Ok(())
+    }
+
+    fn service_main(_args: Vec<OsString>) {
+        if let Err(e) = serve() {
+            tracing::error!("service: {e:#}");
+        }
+    }
+
+    /// Runs the daemon in service mode until the SCM asks it to stop.
+    fn serve() -> Result<()> {
+        let stop = Arc::new(tokio::sync::Notify::new());
+        let notify = stop.clone();
+        let handle = service_control_handler::register(NAME, move |control| match control {
+            ServiceControl::Stop | ServiceControl::Shutdown => {
+                notify.notify_one();
+                ServiceControlHandlerResult::NoError
+            }
+            ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+            _ => ServiceControlHandlerResult::NotImplemented,
+        })?;
+        let report = |state: ServiceState, code: u32| {
+            let controls_accepted = if state == ServiceState::Running {
+                ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN
+            } else {
+                ServiceControlAccept::empty()
+            };
+            let _ = handle.set_service_status(ScmStatus {
+                service_type: ServiceType::OWN_PROCESS,
+                current_state: state,
+                controls_accepted,
+                exit_code: ServiceExitCode::Win32(code),
+                checkpoint: 0,
+                wait_hint: Duration::from_secs(10),
+                process_id: None,
+            });
+        };
+        report(ServiceState::StartPending, 0);
+        let dir = SERVICE_DIR.get().cloned().unwrap_or_default();
+        let result = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(anyhow::Error::from)
+            .and_then(|runtime| {
+                runtime.block_on(crate::daemon::run_until(
+                    config_file(&dir),
+                    RunMode::Service,
+                    |_| report(ServiceState::Running, 0),
+                    async move { stop.notified().await },
+                ))
+            });
+        report(ServiceState::Stopped, if result.is_ok() { 0 } else { 1 });
+        result
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 mod platform {
     use super::*;
 
@@ -686,8 +1065,8 @@ mod platform {
     pub const UNIT_PATH: &str = "";
     fn unsupported() -> &'static str {
         tr!(
-            "only Linux (systemd) and macOS (launchd) are supported",
-            "仅支持 Linux (systemd) 和 macOS (launchd)"
+            "only Linux (systemd), macOS (launchd) and Windows are supported",
+            "仅支持 Linux (systemd)、macOS (launchd) 和 Windows"
         )
     }
 
@@ -719,6 +1098,27 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_command_lines() {
+        assert_eq!(
+            windows_args(
+                r#""C:\Program Files\proxy-tui\proxy-tui.exe" daemon --dir "C:\Users\a b\.proxy-tui" --service"#
+            ),
+            vec![
+                r"C:\Program Files\proxy-tui\proxy-tui.exe",
+                "daemon",
+                "--dir",
+                r"C:\Users\a b\.proxy-tui",
+                "--service"
+            ]
+        );
+        assert_eq!(
+            windows_args(r#"x "a\"b" "c d\\" e\f "#),
+            vec!["x", r#"a"b"#, r"c d\", r"e\f"]
+        );
+        assert_eq!(windows_args(r#"x """#), vec!["x", ""]);
+    }
 
     #[test]
     fn systemctl_show_states() {
@@ -753,7 +1153,10 @@ mod tests {
             "[Service]\nExecStart=/usr/local/bin/proxy-tui daemon --dir /home/u/.proxy-tui\n";
         assert_eq!(parse_dir_arg(unit).as_deref(), Some("/home/u/.proxy-tui"));
         let plist = "<array>\n<string>/usr/local/bin/proxy-tui</string>\n<string>daemon</string>\n<string>--dir</string>\n<string>/Users/alice/.proxy-tui</string>\n</array>";
-        assert_eq!(parse_dir_arg(plist).as_deref(), Some("/Users/alice/.proxy-tui"));
+        assert_eq!(
+            parse_dir_arg(plist).as_deref(),
+            Some("/Users/alice/.proxy-tui")
+        );
         assert_eq!(parse_dir_arg("<string>x</string>"), None);
 
         let odd = "/srv/my data/100%$HOME\\\"x";

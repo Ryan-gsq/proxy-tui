@@ -170,21 +170,10 @@ impl FormatTime for LocalTime {
 }
 
 fn timestamp() -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = now.as_secs() as libc::time_t;
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    unsafe { libc::localtime_r(&secs, &mut tm) };
+    let t = super::clock::now();
     format!(
         "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
-        tm.tm_year + 1900,
-        tm.tm_mon + 1,
-        tm.tm_mday,
-        tm.tm_hour,
-        tm.tm_min,
-        tm.tm_sec,
-        now.subsec_millis()
+        t.year, t.month, t.day, t.hour, t.minute, t.second, t.millis
     )
 }
 
@@ -251,7 +240,7 @@ pub fn log_path_for(config_path: &Path) -> PathBuf {
 
 /// Reads up to `max_lines` trailing lines. Returns the lines and the file length.
 pub fn tail(path: &Path, max_lines: usize) -> io::Result<(Vec<String>, u64)> {
-    let mut file = File::open(path)?;
+    let mut file = safefs::open_shared(path)?;
     let len = file.metadata()?.len();
     let start = len.saturating_sub(TAIL_BYTES);
     file.seek(SeekFrom::Start(start))?;

@@ -12,6 +12,7 @@ use super::logview::LogView;
 use super::menu::RunMenu;
 use super::theme::{bold, dim, key_hints, mode_badge, pad, rounded, ACCENT, DIM, SPINNER};
 use crate::api::{RunMode, Status};
+use crate::config::admin_name;
 use crate::manage::RunState;
 use crate::{fmt_bytes, fmt_duration, tr};
 
@@ -199,10 +200,14 @@ impl App {
             }
         }
         if !self.root {
-            spans.push(dim(tr!(
-                "  · service actions need sudo",
-                "  · 服务操作需要 sudo"
-            )));
+            spans.push(dim(if cfg!(windows) {
+                tr!(
+                    "  · service actions need an Administrator terminal",
+                    "  · 服务操作需要以管理员身份运行"
+                )
+            } else {
+                tr!("  · service actions need sudo", "  · 服务操作需要 sudo")
+            }));
         }
         f.render_widget(
             Paragraph::new(vec![current, Line::from(spans)]).block(rounded(tr!(
@@ -247,26 +252,35 @@ impl App {
                 "服务正在运行，正在等待守护进程就绪…"
             ))),
             service => {
-                text.push(hint(tr!(
-                    "Press s → 1 to start one-shot: runs inside this panel and stops when it quits (no install, no root)",
-                    "按 s → 1 一次性启动：在本面板内运行，退出面板即停止（无需安装、无需 root）",
+                let admin = admin_name();
+                text.push(hint(&tr!(
+                    format!("Press s → 1 to start one-shot: runs inside this panel and stops when it quits (no install, no {admin})"),
+                    format!("按 s → 1 一次性启动：在本面板内运行，退出面板即停止（无需安装、无需{admin}）"),
                 )));
                 match service {
                     Some(s) if s.installed => text.push(hint(tr!(
                         "Press s → 3 to start the service: runs in the background (installed, starts at boot)",
                         "按 s → 3 启动服务：常驻后台（已安装、开机自启）"
                     ))),
-                    Some(s) if s.supported => text.push(hint(tr!(
-                        "Press s → 6 to install the service: runs in the background, starts at boot (needs root)",
-                        "按 s → 6 安装服务：常驻后台、开机自启（需要 root）"
+                    Some(s) if s.supported => text.push(hint(&tr!(
+                        format!("Press s → 6 to install the service: runs in the background, starts at boot (needs {admin})"),
+                        format!("按 s → 6 安装服务：常驻后台、开机自启（需要{admin}）")
                     ))),
                     _ => {}
                 }
             }
         }
+        let install = if cfg!(windows) {
+            tr!(
+                "proxy-tui service install (as Administrator)",
+                "proxy-tui service install（以管理员身份）"
+            )
+        } else {
+            "sudo proxy-tui service install"
+        };
         text.push(Line::from(dim(tr!(
-            "CLI: proxy-tui run --detach (background one-shot) · sudo proxy-tui service install (service) · proxy-tui --help",
-            "命令行：proxy-tui run --detach（后台一次性）· sudo proxy-tui service install（服务）· proxy-tui --help",
+            format!("CLI: proxy-tui run --detach (background one-shot) · {install} (service) · proxy-tui --help"),
+            format!("命令行：proxy-tui run --detach（后台一次性）· {install}（服务）· proxy-tui --help"),
         ))));
         f.render_widget(
             Paragraph::new(text)

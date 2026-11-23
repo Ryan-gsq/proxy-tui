@@ -80,7 +80,7 @@ macro_rules! tr {
 /// The system's interface language; English unless it is Chinese.
 pub fn system() -> Language {
     from_env(|name| std::env::var(name).ok())
-        .or_else(apple_language)
+        .or_else(os_language)
         .unwrap_or(Language::En)
 }
 
@@ -105,7 +105,7 @@ fn from_tag(tag: &str) -> Language {
 /// macOS keeps the language list in user defaults; apps started outside a
 /// terminal often have no locale variables.
 #[cfg(target_os = "macos")]
-fn apple_language() -> Option<Language> {
+fn os_language() -> Option<Language> {
     let out = std::process::Command::new("defaults")
         .args(["read", "-g", "AppleLanguages"])
         .stderr(std::process::Stdio::null())
@@ -118,8 +118,21 @@ fn apple_language() -> Option<Language> {
         .map(from_tag)
 }
 
-#[cfg(not(target_os = "macos"))]
-fn apple_language() -> Option<Language> {
+/// Windows sets no locale variables: use the user's display language.
+#[cfg(windows)]
+fn os_language() -> Option<Language> {
+    const LANG_CHINESE: u16 = 0x04;
+    let lang = unsafe { windows_sys::Win32::Globalization::GetUserDefaultUILanguage() };
+    // The primary language is the low 10 bits of the language id.
+    Some(if lang & 0x3ff == LANG_CHINESE {
+        Language::Zh
+    } else {
+        Language::En
+    })
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn os_language() -> Option<Language> {
     None
 }
 

@@ -158,6 +158,8 @@ pub fn bind_socket(addr: SocketAddr) -> io::Result<TcpListener> {
         Domain::IPV6
     };
     let sock = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    // On Windows SO_REUSEADDR would let another socket take over the port.
+    #[cfg(unix)]
     sock.set_reuse_address(true)?;
     if addr.is_ipv6() {
         // Separate v4/v6 listeners keep getsockname() exact for egress selection.

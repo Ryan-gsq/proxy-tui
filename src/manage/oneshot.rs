@@ -72,6 +72,7 @@ impl Oneshot {
     /// the proxy cleanly, even if the UI thread is stuck on a hung-up tty: a
     /// dedicated thread waits for the signal, runs `before_exit`, stops the proxy
     /// and exits. Call before any other thread is spawned so all inherit the mask.
+    #[cfg(unix)]
     pub fn stop_on_termination(&self, before_exit: fn()) {
         let set = unsafe {
             let mut set: libc::sigset_t = std::mem::zeroed();
@@ -91,6 +92,40 @@ impl Oneshot {
             before_exit();
             handle.stop();
             std::process::exit(128 + sig);
+        });
+    }
+
+    /// Closing the console window, logging off or shutting down must still stop
+    /// the proxy cleanly: a dedicated thread waits for the event, runs
+    /// `before_exit`, stops the proxy and exits (Windows allows a few seconds).
+    #[cfg(windows)]
+    pub fn stop_on_termination(&self, before_exit: fn()) {
+        let handle = self.clone();
+        std::thread::spawn(move || {
+            use tokio::signal::windows::{ctrl_close, ctrl_logoff, ctrl_shutdown};
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            let ended = runtime.block_on(async {
+                let mut close = ctrl_close().ok();
+                let mut logoff = ctrl_logoff().ok();
+                let mut shutdown = ctrl_shutdown().ok();
+                tokio::select! {
+                    Some(_) = async { close.as_mut()?.recv().await } => true,
+                    Some(_) = async { logoff.as_mut()?.recv().await } => true,
+                    Some(_) = async { shutdown.as_mut()?.recv().await } => true,
+                    else => false,
+                }
+            });
+            if !ended {
+                return;
+            }
+            before_exit();
+            handle.stop();
+            std::process::exit(1);
         });
     }
 }

@@ -10,6 +10,7 @@ use super::app::App;
 use super::form::Purpose;
 use super::theme::{bold, dim, pad, popup, ACCENT, DIM};
 use crate::api::RunMode;
+use crate::config::admin_name;
 use crate::manage::{service, Action};
 use crate::tr;
 
@@ -269,22 +270,26 @@ impl App {
             Line::from(spans)
         };
         let mut lines = vec![Line::from(Span::styled(
-            tr!(
-                " One-shot mode  exits with its process · no install, no root",
-                " 一次性模式  随启动它的进程退出 · 无需安装和 root"
-            ),
+            {
+                let admin = admin_name();
+                tr!(
+                    format!(" One-shot mode  exits with its process · no install, no {admin}"),
+                    format!(" 一次性模式  随启动它的进程退出 · 无需安装和{admin}")
+                )
+            },
             bold(Color::Magenta),
         ))];
         for (idx, item) in ITEMS.iter().enumerate() {
             if idx == 2 {
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(
-                    tr!(
-                        format!(
-                            " Service mode  {manager} · background · starts at boot · needs root"
-                        ),
-                        format!(" 服务模式  {manager} 托管，常驻后台、开机自启 · 需要 root")
-                    ),
+                    {
+                        let admin = admin_name();
+                        tr!(
+                            format!(" Service mode  {manager} · background · starts at boot · needs {admin}"),
+                            format!(" 服务模式  {manager} 托管，常驻后台、开机自启 · 需要{admin}")
+                        )
+                    },
                     bold(Color::Green),
                 )));
             }

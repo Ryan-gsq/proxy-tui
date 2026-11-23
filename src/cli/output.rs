@@ -442,7 +442,7 @@ pub fn logs(manager: &mut Manager, lines: usize, follow: bool, json: bool) -> Re
     }
     loop {
         std::thread::sleep(Duration::from_millis(500));
-        let Ok(mut file) = std::fs::File::open(&path) else {
+        let Ok(mut file) = crate::config::safefs::open_shared(&path) else {
             continue;
         };
         let len = file.metadata()?.len();

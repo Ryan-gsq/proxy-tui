@@ -2,7 +2,10 @@
 
 [English](README.md) | **简体中文**
 
-用 Rust 编写的高吞吐代理，支持 Linux 和 macOS：一个端口同时提供 HTTP、HTTPS、SOCKS5 代理，从哪块网卡进来就从哪块网卡出去，并自带 TUI 管理面板和给 Agent 用的命令行。
+[![CI](https://github.com/Ryan-gsq/proxy-tui/actions/workflows/ci.yml/badge.svg)](https://github.com/Ryan-gsq/proxy-tui/actions/workflows/ci.yml)
+[![Build](https://github.com/Ryan-gsq/proxy-tui/actions/workflows/release.yml/badge.svg)](https://github.com/Ryan-gsq/proxy-tui/actions/workflows/release.yml)
+
+用 Rust 编写的高吞吐代理，支持 Linux、macOS 和 Windows：一个端口同时提供 HTTP、HTTPS、SOCKS5 代理，从哪块网卡进来就从哪块网卡出去，并自带 TUI 管理面板和给 Agent 用的命令行。
 
 ![proxy-tui 管理面板演示](docs/demo.gif)
 
@@ -18,7 +21,7 @@
   - 两者都通过同一个服务层管理代理，并共用**同一个数据目录**。
 - **两种运行模式**：
   - **一次性模式**：不需要 root，随启动它的进程退出。
-  - **服务模式**：由 systemd / launchd 托管，常驻后台、开机自启，需要 root。
+  - **服务模式**：由 systemd / launchd / Windows 服务管理器托管，常驻后台、开机自启，需要 root（Windows 上需要管理员）。
 
 ## 目录
 
@@ -39,7 +42,19 @@
 
 ## 安装
 
-需要 Rust 工具链（stable）。
+### 预编译版本
+
+每个版本标签都会在 [Releases](https://github.com/Ryan-gsq/proxy-tui/releases) 页面发布编译好的程序；每次推送到 `main`，[Build 工作流](https://github.com/Ryan-gsq/proxy-tui/actions/workflows/release.yml)也会构建一份，可以在运行记录的 artifacts 里下载：
+
+| 平台 | 文件 |
+|---|---|
+| Linux x86_64 / aarch64（静态链接，musl） | `proxy-tui-*-x86_64-unknown-linux-musl.tar.gz` / `…-aarch64-unknown-linux-musl.tar.gz` |
+| macOS Intel / Apple 芯片 | `proxy-tui-*-x86_64-apple-darwin.tar.gz` / `…-aarch64-apple-darwin.tar.gz` |
+| Windows x86_64 | `proxy-tui-*-x86_64-pc-windows-msvc.zip` |
+
+### 从源码编译
+
+需要 Rust 工具链（stable；Windows 上还需要 MSVC 构建工具）。
 
 ```bash
 git clone https://github.com/Ryan-gsq/proxy-tui.git
@@ -145,6 +160,7 @@ curl --proxy-insecure -x https://USER:PASS@HOST:PORT https://example.com  # 到�
   - **只改动自己创建的规则和路由表**：同步和退出清理时，只删除本进程添加的规则、只清空本进程写入的表。其他程序在相同优先级上的规则不受影响。
   - 如果某张路由表里已经有别的路由，不会清空它：这块网卡会报"路由表已有其他路由"，请调整 `table_base`。
 - **macOS**：系统本身支持按网卡区分的默认路由，绑定网卡即可，不需要额外配置
+- **Windows**：默认使用强主机模型发送，绑定了源地址的连接会从拥有该地址的网卡出去；代理还会设置 `IP_UNICAST_IF` / `IPV6_UNICAST_IF`。网卡、默认网关和 DNS 服务器取自网卡设置（`GetAdaptersAddresses`），不需要策略路由
 - 没有默认路由的网卡（例如 docker0、仅内网网卡、loopback）不作为出口，这类连接交给系统路由。也可以用 `egress.iface_override` 手动指定映射，例如 `eth0 = "eth1"`
 
 ### IPv6 出口判断
@@ -191,7 +207,7 @@ macOS 判断默认路由时，只认带网关标志（`G`）的路由，`bridge1
 
 在面板里一次性启动时，会先弹出设置表单，确认后再启动。代理运行在面板进程内，退出面板、关闭终端都会让它停止。
 
-不用 root 打开面板时，服务相关的操作（启动、停止、安装等）不可用，但可以使用一次性模式，也可以修改服务的设置（只要数据目录属于你）。服务操作在后台线程中执行，不会卡住界面。
+不用 root（Windows 上是不以管理员身份）打开面板时，服务相关的操作（启动、停止、安装等）不可用，但可以使用一次性模式，也可以修改服务的设置（只要数据目录属于你）。服务操作在后台线程中执行，不会卡住界面。
 
 ### 界面语言
 
@@ -217,7 +233,7 @@ macOS 判断默认路由时，只认带网关标志（`G`）的路由，`bridge1
 | `config reload` | 手动改过 `config.toml` 后，让运行中的代理重新读取 |
 | `conns [-n 50]` | 活动连接（按流量排序） |
 | `logs [-n 100] [-f]` | 查看日志，`-f` 持续输出新内容。加 `--json` 时输出 `{"ok", "log_path", "lines"}`；同时加 `-f` 时每行输出一个 `{"line": ...}` |
-| `service status\|install\|start\|stop\|restart\|uninstall` | 服务模式管理（除 `status` 外都需要 root）；`install` 也可以带设置参数 |
+| `service status\|install\|start\|stop\|restart\|uninstall` | 服务模式管理（除 `status` 外都需要 root，Windows 上需要以管理员身份运行终端）；`install` 也可以带设置参数 |
 | `tui [--start] [--lang auto\|en\|zh] [设置参数]` | 打开管理面板（不带命令时默认打开）；`--start` 表示打开后立即以一次性模式启动；`--lang` 指定本次的界面语言 |
 
 所有命令都支持全局参数：
@@ -307,13 +323,14 @@ proxy-tui stop                                                           # 停�
 | **一次性 · 前台** | `proxy-tui run` | Ctrl+C、关闭终端、`kill`，或 `proxy-tui stop` | 否 |
 | **一次性 · 后台** | `proxy-tui run --detach` | `proxy-tui stop`（关闭调用它的终端不会让它停止） | 否 |
 | **一次性 · 面板内** | 面板里按 `s` → 1，或 `proxy-tui tui --start` | 退出面板或关闭终端；`proxy-tui stop` 会被拒绝 | 否 |
-| **服务** | `sudo proxy-tui service install`，或面板里按 `s` → 6 | `sudo proxy-tui service stop`（下次开机仍会自启） | 是 |
+| **服务** | `sudo proxy-tui service install`（Windows 上在管理员终端里运行 `proxy-tui service install`），或面板里按 `s` → 6 | `sudo proxy-tui service stop`（下次开机仍会自启） | 是（Windows 上需要管理员） |
 
 - 同一个数据目录里同时只能运行一个代理。已经在运行时：
   - `run` 会报错。
   - `service start` 和 `service install` 会先要求停掉一次性代理。
 - 在面板里选择"安装服务（转为常驻）"时，会先停掉面板里的一次性代理，再交给服务运行。
 - 一次性模式不需要 root，但 Linux 的策略路由只有以 root 运行时才会自动配置。
+- Windows 上服务以 LocalSystem 运行，崩溃后会自动重启；程序安装到 `%ProgramFiles%\proxy-tui\proxy-tui.exe`。
 
 ## 数据目录
 
@@ -325,8 +342,10 @@ proxy-tui stop                                                           # 停�
 ├── cert.pem         HTTPS 代理的自签证书
 ├── key.pem
 ├── logs/            日志
-└── control.sock     控制 socket（仅在运行时存在）
+└── control.sock     控制 socket（仅在运行时存在；Windows 上是命名管道）
 ```
+
+Windows 上默认目录是 `%USERPROFILE%\.proxy-tui`，控制通道是命名管道 `\\.\pipe\proxy-tui-<数据目录的哈希>`，只接受本机连接。
 
 数据目录按以下顺序确定：
 
@@ -347,9 +366,11 @@ proxy-tui stop                                                           # 停�
 
 这样，目录主人无法借助 root 服务读写目录之外的文件；如果整个数据目录被换成软链接，服务会拒绝启动并说明原因。
 
+Windows 上文件继承数据目录的权限。以管理员身份运行的进程不跟随数据目录里的软链接和目录联接，`tls.cert`、`tls.key`、`log.dir` 也只能指向数据目录内部。服务运行时，用命令行或面板管理它需要以管理员身份运行终端：只有 SYSTEM 和管理员能向服务的控制管道发送命令。
+
 ## 日志
 
-日志在 `<数据目录>/logs/proxy-tui.log`，服务模式和一次性模式都写这个文件。每行都标注是哪种模式写入的（`service` / `oneshot`）。文件超过 `log.max_size_mb` 后轮转为 `proxy-tui.log.1 … .N`。
+日志在 `<数据目录>/logs/proxy-tui.log`，服务模式和一次性模式都写这个文件。每行都标注是哪种模式写入的（`service` / `oneshot`）。文件超过 `log.max_size_mb` 后轮转为 `proxy-tui.log.1 … .N`，保留 `log.max_files` 个旧文件，所以日志总共最多占用约 `(max_files + 1) × max_size_mb`，默认 60 MB。`max_size_mb` 至少为 1，不能关闭轮转。
 
 日志由后台线程写盘，代理线程不会等待磁盘。写入队列满时会丢弃日志行，并在日志里记一行丢弃了多少。`[log]` 的设置在进程启动时生效，修改后需要重启代理。
 
@@ -410,8 +431,8 @@ language = "auto"         # 管理面板语言：auto 跟随系统（非中文�
 [log]
 level = "info"            # off / error / warn / info / debug / trace（每条连接的摘要是 info 级别）
 dir = ""                  # 留空表示 <数据目录>/logs
-max_size_mb = 10          # 单个文件上限，超过后轮转
-max_files = 5             # 保留 proxy-tui.log.1 … .5
+max_size_mb = 10          # 单个文件上限，超过后轮转（至少为 1）
+max_files = 5             # 保留 proxy-tui.log.1 … .5；总共最多 60 MB
 ```
 
 ## 项目结构
@@ -423,6 +444,9 @@ proxy-tui/
 ├── README.md            英文说明
 ├── README.zh-CN.md      中文说明
 ├── docs/demo.gif        管理面板演示
+├── .github/workflows/
+│   ├── ci.yml           在 Linux、macOS、Windows 上运行 fmt、clippy 和全部测试
+│   └── release.yml      构建全部平台；打版本标签时发布 Release
 ├── src/                 源码（见下）
 └── tests/e2e.rs         端到端测试：在本机启动真实代理，用 TCP / UDP 客户端和模拟源站验证
 ```
@@ -451,12 +475,13 @@ src/
 │   └── theme.rs         样式、弹窗、按键提示
 ├── manage/              服务层 · 两个交互层共用的管理接口
 │   ├── mod.rs           Manager：状态、设置读写、启动 / 停止、服务操作
-│   ├── client.rs        控制 socket 客户端
+│   ├── client.rs        控制通道客户端
 │   ├── oneshot.rs       内嵌在面板进程里的一次性代理
-│   └── service.rs       systemd / launchd
+│   └── service.rs       systemd / launchd / Windows 服务
 ├── daemon/              运行层 · 守护进程
 │   ├── mod.rs           运行时状态、热更新、控制请求处理
-│   ├── control.rs       控制 socket 服务端
+│   ├── clock.rs         本地时间（日志和事件的时间戳）
+│   ├── control.rs       控制 socket 服务端（Unix socket / Windows 命名管道）
 │   ├── logging.rs       文件日志与轮转
 │   └── stats.rs         流量和连接统计
 ├── proxy/               运行层 · 代理协议
@@ -467,14 +492,17 @@ src/
 │   ├── pool.rs          普通 HTTP 转发的源站连接池
 │   └── relay.rs         双向转发、流量计数
 ├── net/                 运行层 · 网络出口
-│   ├── egress.rs        出口选择、Happy Eyeballs
+│   ├── egress.rs        出口选择、Happy Eyeballs、把套接字绑定到网卡
 │   ├── dns.rs           经出口网卡发送的 DNS 查询
-│   ├── netif.rs         网卡发现、IPv6 探测
+│   ├── netif.rs         网卡发现（getifaddrs / GetAdaptersAddresses）、IPv6 探测
 │   └── routing.rs       Linux 策略路由
 ├── config/
 │   ├── mod.rs           配置结构、校验、设置的读取与修改
 │   ├── paths.rs         数据目录的确定、文件所有者
-│   └── safefs.rs        root 访问用户目录时的安全读写
+│   └── safefs/          root 访问用户目录时的安全读写
+│       ├── mod.rs       公共接口
+│       ├── unix.rs      基于 openat，不跟随软链接
+│       └── windows.rs   允许共享访问的文件；以管理员运行时拒绝软链接和目录联接
 ├── api.rs               控制协议：请求、响应、状态
 └── i18n.rs              界面语言（英文 / 中文）
 ```
@@ -486,6 +514,8 @@ cargo build --release            # 产物：target/release/proxy-tui
 cargo test                       # 单元测试 + 端到端测试
 cargo clippy --all-targets
 ```
+
+每次推送和 Pull Request，GitHub Actions 都会在 Linux、macOS、Windows 上运行 fmt、clippy 和全部测试。
 
 端到端测试覆盖：
 

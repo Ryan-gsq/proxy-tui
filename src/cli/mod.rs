@@ -52,10 +52,12 @@ const GUIDE: &str = "\
 运行模式:
   一次性模式  run（前台，Ctrl+C 停止）、run --detach（后台，proxy-tui stop 停止）、
               或在管理面板里启动（退出面板即停止）；不需要 root
-  服务模式    service install；systemd / launchd 托管，常驻后台、开机自启；需要 root
+  服务模式    service install；systemd / launchd / Windows 服务托管，常驻后台、开机自启；
+              需要 root（Windows 上需要以管理员身份运行终端）
 
 数据目录（配置、证书、日志、控制 socket）:
-  默认 ~/.proxy-tui（用 sudo 时是调用者本人的目录）；已安装服务时跟随服务的目录；
+  默认 ~/.proxy-tui（用 sudo 时是调用者本人的目录；Windows 上是 %USERPROFILE%\\.proxy-tui）；
+  已安装服务时跟随服务的目录；
   --dir 或环境变量 PROXY_TUI_DIR 可指定。TUI 与 CLI、两种运行模式都共用这个目录。
 
 退出码: 0 成功 · 1 失败 · 2 参数错误 · 3 代理未运行";
@@ -200,9 +202,13 @@ enum Cmd {
     /// 服务模式：systemd / launchd 托管，常驻后台、开机自启（需要 root）
     #[command(subcommand)]
     Service(ServiceCmd),
-    /// 守护进程入口（供 systemd / launchd 和 run --detach 调用）
+    /// 守护进程入口（供 systemd / launchd / Windows 服务和 run --detach 调用）
     #[command(hide = true)]
-    Daemon,
+    Daemon {
+        /// 由 Windows 服务控制管理器启动
+        #[arg(long)]
+        service: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -367,7 +373,9 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         Cmd::Conns { limit } => output::conns(&mut manager, limit, json)?,
         Cmd::Logs { lines, follow } => output::logs(&mut manager, lines, follow, json)?,
         Cmd::Service(cmd) => service(&mut manager, cmd, json)?,
-        Cmd::Daemon => manager.run_foreground(|_| {})?,
+        #[cfg(windows)]
+        Cmd::Daemon { service: true } => manage::service::run_service(manager.dir().to_path_buf())?,
+        Cmd::Daemon { .. } => manager.run_foreground(|_| {})?,
     }
     Ok(ExitCode::SUCCESS)
 }

@@ -380,6 +380,7 @@ fn parse_response(buf: &[u8], id: u16, qtype: u16) -> Option<DnsResponse> {
 /// Upstream servers from resolv.conf. When it only names a local stub (e.g.
 /// systemd-resolved's 127.0.0.53), the stub's own upstream list is used so the
 /// queries can still be pinned to an egress.
+#[cfg(unix)]
 fn system_nameservers() -> Vec<IpAddr> {
     ["/etc/resolv.conf", "/run/systemd/resolve/resolv.conf"]
         .into_iter()
@@ -388,6 +389,28 @@ fn system_nameservers() -> Vec<IpAddr> {
         .unwrap_or_default()
 }
 
+/// The DNS servers configured on adapters that are up, without Windows'
+/// deprecated `fec0:0:0:ffff::1..3` placeholders.
+#[cfg(windows)]
+fn system_nameservers() -> Vec<IpAddr> {
+    use ipconfig::OperStatus;
+    let mut out: Vec<IpAddr> = Vec::new();
+    for adapter in ipconfig::get_adapters().unwrap_or_default() {
+        if adapter.oper_status() != OperStatus::IfOperStatusUp {
+            continue;
+        }
+        for ip in adapter.dns_servers() {
+            let placeholder =
+                matches!(ip, IpAddr::V6(v6) if v6.segments()[..4] == [0xfec0, 0, 0, 0xffff]);
+            if !ip.is_loopback() && !ip.is_unspecified() && !placeholder && !out.contains(ip) {
+                out.push(*ip);
+            }
+        }
+    }
+    out
+}
+
+#[cfg(unix)]
 fn nameservers_in(path: &str) -> Vec<IpAddr> {
     let Ok(text) = std::fs::read_to_string(path) else {
         return Vec::new();
@@ -408,9 +431,18 @@ fn nameservers_in(path: &str) -> Vec<IpAddr> {
     out
 }
 
+fn hosts_path() -> std::path::PathBuf {
+    if cfg!(windows) {
+        let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+        std::path::Path::new(&root).join(r"System32\drivers\etc\hosts")
+    } else {
+        "/etc/hosts".into()
+    }
+}
+
 fn read_hosts() -> HashMap<String, Vec<IpAddr>> {
     let mut map: HashMap<String, Vec<IpAddr>> = HashMap::new();
-    let Ok(text) = std::fs::read_to_string("/etc/hosts") else {
+    let Ok(text) = std::fs::read_to_string(hosts_path()) else {
         return map;
     };
     for line in text.lines() {

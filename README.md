@@ -2,7 +2,10 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-A high-throughput proxy for Linux and macOS, written in Rust. One port serves HTTP, HTTPS and SOCKS5; traffic leaves through the same network interface it came in on; and it comes with a TUI dashboard for people and a CLI for agents and scripts.
+[![CI](https://github.com/Ryan-gsq/proxy-tui/actions/workflows/ci.yml/badge.svg)](https://github.com/Ryan-gsq/proxy-tui/actions/workflows/ci.yml)
+[![Build](https://github.com/Ryan-gsq/proxy-tui/actions/workflows/release.yml/badge.svg)](https://github.com/Ryan-gsq/proxy-tui/actions/workflows/release.yml)
+
+A high-throughput proxy for Linux, macOS and Windows, written in Rust. One port serves HTTP, HTTPS and SOCKS5; traffic leaves through the same network interface it came in on; and it comes with a TUI dashboard for people and a CLI for agents and scripts.
 
 ![proxy-tui dashboard demo](docs/demo.gif)
 
@@ -18,7 +21,7 @@ A high-throughput proxy for Linux and macOS, written in Rust. One port serves HT
   - Both go through the same service layer and share **one data directory**.
 - **Two run modes**:
   - **One-shot**: no root needed; stops with the process that started it.
-  - **Service**: managed by systemd / launchd, runs in the background and starts at boot; needs root.
+  - **Service**: managed by systemd / launchd / the Windows service manager, runs in the background and starts at boot; needs root (Administrator on Windows).
 
 ## Contents
 
@@ -39,7 +42,19 @@ A high-throughput proxy for Linux and macOS, written in Rust. One port serves HT
 
 ## Installation
 
-Requires a stable Rust toolchain.
+### Prebuilt binaries
+
+Every version tag publishes binaries on the [Releases](https://github.com/Ryan-gsq/proxy-tui/releases) page, and every push to `main` builds them as artifacts of the [Build workflow](https://github.com/Ryan-gsq/proxy-tui/actions/workflows/release.yml):
+
+| Platform | Archive |
+|---|---|
+| Linux x86_64 / aarch64 (static, musl) | `proxy-tui-*-x86_64-unknown-linux-musl.tar.gz` / `…-aarch64-unknown-linux-musl.tar.gz` |
+| macOS Intel / Apple silicon | `proxy-tui-*-x86_64-apple-darwin.tar.gz` / `…-aarch64-apple-darwin.tar.gz` |
+| Windows x86_64 | `proxy-tui-*-x86_64-pc-windows-msvc.zip` |
+
+### From source
+
+Requires a stable Rust toolchain (on Windows, with the MSVC build tools).
 
 ```bash
 git clone https://github.com/Ryan-gsq/proxy-tui.git
@@ -145,6 +160,7 @@ Each connection is mapped, by **the local IP the client connected to**, to the i
   - **Only its own rules and tables are touched**: synchronisation and cleanup on exit delete only rules this process added and flush only tables it wrote. Rules of other programs at the same priorities are left alone.
   - A table that already holds other routes is never flushed: that interface reports that its routing table is in use; change `table_base` in that case.
 - **macOS** already supports per-interface default routes; binding to the interface is enough.
+- **Windows** sends with the strong host model by default: a socket bound to a source address leaves through the interface that owns it. The proxy also sets `IP_UNICAST_IF` / `IPV6_UNICAST_IF`. Interfaces, default gateways and DNS servers come from the adapter settings (`GetAdaptersAddresses`); no policy routing is needed.
 - Interfaces without a default route (docker0, LAN-only interfaces, loopback) are not used as egress; such connections follow the system routes. `egress.iface_override` can map interfaces by hand, for example `eth0 = "eth1"`.
 
 ### When IPv6 counts as an egress
@@ -191,7 +207,7 @@ Running `proxy-tui` without arguments opens the dashboard. It uses the same serv
 
 Starting one-shot mode from the dashboard first shows the settings form. The proxy then runs inside the dashboard process; quitting the dashboard or closing the terminal stops it.
 
-Without root, service actions (start, stop, install, ...) are unavailable, but one-shot mode works and the service's settings can still be edited (as long as the data directory is yours). Service actions run on a background thread, so the interface never freezes.
+Without root (on Windows: an Administrator terminal), service actions (start, stop, install, ...) are unavailable, but one-shot mode works and the service's settings can still be edited (as long as the data directory is yours). Service actions run on a background thread, so the interface never freezes.
 
 ### Interface language
 
@@ -217,7 +233,7 @@ CLI messages are currently in Chinese regardless of this setting.
 | `config reload` | Make a running proxy re-read a hand-edited `config.toml` |
 | `conns [-n 50]` | Active connections, by traffic |
 | `logs [-n 100] [-f]` | Show the log; `-f` keeps printing new lines. With `--json` the output is `{"ok", "log_path", "lines"}`, and with `-f` one `{"line": ...}` object per line |
-| `service status\|install\|start\|stop\|restart\|uninstall` | Service management (everything but `status` needs root); `install` also accepts settings |
+| `service status\|install\|start\|stop\|restart\|uninstall` | Service management (everything but `status` needs root, or an Administrator terminal on Windows); `install` also accepts settings |
 | `tui [--start] [--lang auto\|en\|zh] [settings]` | Open the dashboard (the default without a command); `--start` starts one-shot mode right away; `--lang` sets the interface language for this session |
 
 Global options for every command:
@@ -307,13 +323,14 @@ proxy-tui stop                                                           # stop
 | **One-shot · foreground** | `proxy-tui run` | Ctrl+C, closing the terminal, `kill`, or `proxy-tui stop` | No |
 | **One-shot · background** | `proxy-tui run --detach` | `proxy-tui stop` (closing the calling terminal does not stop it) | No |
 | **One-shot · in the dashboard** | `s` → 1 in the dashboard, or `proxy-tui tui --start` | quitting the dashboard or closing the terminal; `proxy-tui stop` is refused | No |
-| **Service** | `sudo proxy-tui service install`, or `s` → 6 in the dashboard | `sudo proxy-tui service stop` (it still starts at the next boot) | Yes |
+| **Service** | `sudo proxy-tui service install` (Windows: `proxy-tui service install` in an Administrator terminal), or `s` → 6 in the dashboard | `sudo proxy-tui service stop` (it still starts at the next boot) | Yes (Administrator on Windows) |
 
 - Only one proxy can run per data directory. While one runs:
   - `run` fails;
   - `service start` and `service install` ask you to stop the one-shot proxy first.
 - Choosing "Install (keep it running)" in the dashboard stops the dashboard's one-shot proxy first and hands over to the service.
 - One-shot mode needs no root, but Linux policy routing is configured only when running as root.
+- On Windows the service runs as LocalSystem and is restarted automatically if it crashes; the program is installed to `%ProgramFiles%\proxy-tui\proxy-tui.exe`.
 
 ## Data directory
 
@@ -325,8 +342,10 @@ Config, certificate, logs and the control socket all live in **one data director
 ├── cert.pem         self-signed certificate of the HTTPS proxy
 ├── key.pem
 ├── logs/            logs
-└── control.sock     control socket (only while running)
+└── control.sock     control socket (only while running; a named pipe on Windows)
 ```
+
+On Windows the default is `%USERPROFILE%\.proxy-tui`, and the control channel is the named pipe `\\.\pipe\proxy-tui-<hash of the data directory>`, which accepts local clients only.
 
 The data directory is chosen in this order:
 
@@ -347,9 +366,11 @@ Because a root process reads and writes a directory owned by a regular user, roo
 
 This way the directory's owner cannot use the root service to read or write files outside the directory; if the whole data directory is replaced by a symlink, the service refuses to start and says why.
 
+On Windows, files inherit the data directory's permissions. An elevated process refuses to follow symlinks and junctions in the data directory, and `tls.cert`, `tls.key` and `log.dir` must stay inside it. Managing a running service from the CLI or the dashboard needs an Administrator terminal, because only SYSTEM and Administrators may send commands to the service's control pipe.
+
 ## Logs
 
-The log is `<data dir>/logs/proxy-tui.log`, written by service and one-shot mode alike; each line says which mode wrote it (`service` / `oneshot`). Beyond `log.max_size_mb` it is rotated to `proxy-tui.log.1 … .N`.
+The log is `<data dir>/logs/proxy-tui.log`, written by service and one-shot mode alike; each line says which mode wrote it (`service` / `oneshot`). Beyond `log.max_size_mb` it is rotated to `proxy-tui.log.1 … .N`, keeping `log.max_files` old files, so the logs never take more than about `(max_files + 1) × max_size_mb`: 60 MB with the defaults. `max_size_mb` must be at least 1, so rotation cannot be switched off.
 
 A background thread writes the log, so proxy threads never wait for the disk. When its queue is full, lines are dropped and a line recording how many were dropped is logged. `[log]` settings take effect when the process starts; changing them requires a restart.
 
@@ -410,8 +431,8 @@ language = "auto"         # dashboard language: auto (follow the system; English
 [log]
 level = "info"            # off / error / warn / info / debug / trace (per-connection summaries are info)
 dir = ""                  # empty: <data dir>/logs
-max_size_mb = 10          # size limit per file before rotation
-max_files = 5             # keeps proxy-tui.log.1 … .5
+max_size_mb = 10          # size limit per file before rotation (at least 1)
+max_files = 5             # keeps proxy-tui.log.1 … .5; 60 MB in total at most
 ```
 
 ## Project structure
@@ -423,6 +444,9 @@ proxy-tui/
 ├── README.md            English documentation
 ├── README.zh-CN.md      Chinese documentation
 ├── docs/demo.gif        dashboard demo
+├── .github/workflows/
+│   ├── ci.yml           fmt, clippy and tests on Linux, macOS and Windows
+│   └── release.yml      builds for all platforms; release on version tags
 ├── src/                 source code (below)
 └── tests/e2e.rs         end-to-end tests: a real proxy on localhost, driven by TCP / UDP clients and mock origins
 ```
@@ -451,12 +475,13 @@ src/
 │   └── theme.rs         styles, popups, key hints
 ├── manage/              service layer · management API shared by both interfaces
 │   ├── mod.rs           Manager: status, settings, start / stop, service actions
-│   ├── client.rs        control socket client
+│   ├── client.rs        control channel client
 │   ├── oneshot.rs       one-shot proxy embedded in the dashboard process
-│   └── service.rs       systemd / launchd
+│   └── service.rs       systemd / launchd / Windows service
 ├── daemon/              runtime layer · daemon
 │   ├── mod.rs           runtime state, live updates, control requests
-│   ├── control.rs       control socket server
+│   ├── clock.rs         local time for log and event timestamps
+│   ├── control.rs       control socket server (Unix socket / Windows named pipe)
 │   ├── logging.rs       file logging and rotation
 │   └── stats.rs         traffic and connection statistics
 ├── proxy/               runtime layer · proxy protocols
@@ -467,14 +492,17 @@ src/
 │   ├── pool.rs          origin connection pool for plain HTTP forwarding
 │   └── relay.rs         two-way relay, traffic counting
 ├── net/                 runtime layer · egress
-│   ├── egress.rs        egress selection, Happy Eyeballs
+│   ├── egress.rs        egress selection, Happy Eyeballs, binding sockets to an interface
 │   ├── dns.rs           DNS queries sent through the egress interface
-│   ├── netif.rs         interface discovery, IPv6 probes
+│   ├── netif.rs         interface discovery (getifaddrs / GetAdaptersAddresses), IPv6 probes
 │   └── routing.rs       Linux policy routing
 ├── config/
 │   ├── mod.rs           config structure, validation, reading and changing settings
 │   ├── paths.rs         choosing the data directory, file ownership
-│   └── safefs.rs        safe file access when root works in a user's directory
+│   └── safefs/          safe file access when root works in a user's directory
+│       ├── mod.rs       shared interface
+│       ├── unix.rs      openat-based, never follows symlinks
+│       └── windows.rs   shared-access files, refuses symlinks and junctions when elevated
 ├── api.rs               control protocol: requests, responses, status
 └── i18n.rs              interface language (English / Chinese)
 ```
@@ -486,6 +514,8 @@ cargo build --release            # output: target/release/proxy-tui
 cargo test                       # unit and end-to-end tests
 cargo clippy --all-targets
 ```
+
+GitHub Actions runs fmt, clippy and all tests on Linux, macOS and Windows for every push and pull request.
 
 The end-to-end tests cover:
 

@@ -1,9 +1,4 @@
-//! 在可能不受信任的数据目录里安全地读写文件。
-//!
-//! 服务以 root 运行，数据目录却归普通用户所有。按路径读写时，用户可以把文件
-//! 或目录换成软链接、硬链接，诱使 root 改写或读出目录之外的文件。这里的所有访问
-//! 都从目录 fd 出发（openat 系列）且不跟随软链接；新文件创建时即带最终权限，
-//! 归属通过 fd 设置；root 读写已有文件前会校验它是只有一个链接的普通文件。
+//! Unix：所有访问都从目录 fd 出发（openat 系列），不跟随软链接。
 
 use std::collections::VecDeque;
 use std::ffi::{CString, OsStr, OsString};
@@ -13,7 +8,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
 
-use super::is_root;
+use crate::config::is_root;
 
 const MAX_SYMLINKS: usize = 32;
 
@@ -342,25 +337,6 @@ impl SafeDir {
             )
         })
         .map(|_| ())
-    }
-}
-
-/// Splits `path` into its directory and file name.
-pub fn split(path: &Path) -> io::Result<(&Path, &str)> {
-    let name = path.file_name().and_then(OsStr::to_str);
-    match (path.parent(), name) {
-        (Some(dir), Some(name)) => Ok((
-            if dir.as_os_str().is_empty() {
-                Path::new(".")
-            } else {
-                dir
-            },
-            name,
-        )),
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("无效的文件路径 {}", path.display()),
-        )),
     }
 }
 

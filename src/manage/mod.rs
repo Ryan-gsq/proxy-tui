@@ -199,11 +199,20 @@ impl Manager {
             .stdout(Stdio::null())
             .stderr(stderr);
         // Own session: closing the caller's terminal must not stop it.
+        #[cfg(unix)]
         unsafe {
             std::os::unix::process::CommandExt::pre_exec(&mut cmd, || {
                 libc::setsid();
                 Ok(())
             });
+        }
+        // No console of its own: closing the caller's window must not stop it.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const DETACHED_PROCESS: u32 = 0x0000_0008;
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
         }
         let mut child = cmd.spawn().context(tr!(
             "starting the background process failed",
@@ -278,9 +287,10 @@ impl Manager {
     /// Before installing the service: writes `update` into the config file.
     pub fn prepare_install(&mut self, update: &Update) -> Result<()> {
         if !config::is_root() {
+            let (admin, hint) = (config::admin_name(), config::elevate_hint());
             bail!(tr!(
-                "service actions need root: run with sudo",
-                "服务操作需要 root 权限：请用 sudo 运行"
+                format!("service actions need {admin}: {hint}"),
+                format!("服务操作需要 {admin} 权限：{hint}")
             ));
         }
         self.ensure_no_oneshot()?;

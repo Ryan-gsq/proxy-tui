@@ -1,5 +1,6 @@
 //! 守护进程：持有运行时状态（配置、统计、网卡、监听），处理控制请求并热更新。
 
+pub mod clock;
 pub mod control;
 pub mod logging;
 pub mod stats;
@@ -66,11 +67,9 @@ impl Ctx {
         let cert = cfg.cert_path(&self.config_path);
         let key = cfg.key_path(&self.config_path);
         let mut sans = vec!["localhost".to_string()];
-        if let Ok(host) = nix::unistd::gethostname() {
-            if let Some(host) = host.to_str() {
-                if !host.is_empty() && host != "localhost" {
-                    sans.push(host.to_string());
-                }
+        if let Some(host) = hostname() {
+            if !host.is_empty() && host != "localhost" {
+                sans.push(host);
             }
         }
         sans.push("127.0.0.1".into());
@@ -523,15 +522,33 @@ async fn net_monitor(ctx: Arc<Ctx>) {
     }
 }
 
-/// Runs the daemon in this process until Ctrl+C, SIGTERM, SIGHUP or (one-shot
-/// only) `proxy-tui stop`. `on_ready` gets the status once it is listening.
+fn hostname() -> Option<String> {
+    #[cfg(unix)]
+    return nix::unistd::gethostname().ok()?.into_string().ok();
+    #[cfg(windows)]
+    return std::env::var("COMPUTERNAME").ok();
+}
+
+/// Runs the daemon in this process until it is told to stop: Ctrl+C or the
+/// terminal going away (see `termination`), or (one-shot only) `proxy-tui stop`.
+/// `on_ready` gets the status once it is listening.
 pub async fn run(config_path: PathBuf, on_ready: impl FnOnce(&Status)) -> Result<()> {
-    let control_path = config::control_socket_for(&config_path);
     let mode = if std::env::var_os(SERVICE_ENV).is_some() {
         RunMode::Service
     } else {
         RunMode::Oneshot
     };
+    run_until(config_path, mode, on_ready, termination()).await
+}
+
+/// Runs the daemon until `stop` completes or, in one-shot mode, `proxy-tui stop`.
+pub async fn run_until(
+    config_path: PathBuf,
+    mode: RunMode,
+    on_ready: impl FnOnce(&Status),
+    stop: impl std::future::Future<Output = ()>,
+) -> Result<()> {
+    let control_path = config::control_socket_for(&config_path);
     let log_cfg = Config::load(&config_path).unwrap_or_default();
     let tag = if mode == RunMode::Service {
         "service"
@@ -550,14 +567,10 @@ pub async fn run(config_path: PathBuf, on_ready: impl FnOnce(&Status)) -> Result
             return Err(e);
         }
     };
-    tracing::info!("control socket {}", daemon.control_path.display());
+    tracing::info!("control {}", control::describe(&daemon.control_path));
     on_ready(&daemon.ctx.status().await);
-    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let mut hup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
     tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = term.recv() => {}
-        _ = hup.recv() => {}
+        _ = stop => {}
         _ = daemon.ctx.stop.notified() => {}
     }
     tracing::info!("shutting down");
@@ -566,6 +579,47 @@ pub async fn run(config_path: PathBuf, on_ready: impl FnOnce(&Status)) -> Result
     Ok(())
 }
 
+/// Ctrl+C, SIGTERM, or SIGHUP from the terminal closing.
+#[cfg(unix)]
+async fn termination() {
+    use tokio::signal::unix::{signal, SignalKind};
+    match (
+        signal(SignalKind::terminate()),
+        signal(SignalKind::hangup()),
+    ) {
+        (Ok(mut term), Ok(mut hup)) => tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+            _ = hup.recv() => {}
+        },
+        _ => {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    }
+}
+
+/// Ctrl+C or Ctrl+Break, the console window closing, logoff or shutdown.
+#[cfg(windows)]
+async fn termination() {
+    use tokio::signal::windows::{ctrl_break, ctrl_close, ctrl_logoff, ctrl_shutdown};
+    let mut brk = ctrl_break().ok();
+    let mut close = ctrl_close().ok();
+    let mut logoff = ctrl_logoff().ok();
+    let mut shutdown = ctrl_shutdown().ok();
+    // A listener that could not be registered yields None and drops out.
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        Some(_) = async { brk.as_mut()?.recv().await } => {}
+        Some(_) = async { close.as_mut()?.recv().await } => {}
+        Some(_) = async { logoff.as_mut()?.recv().await } => {}
+        Some(_) = async { shutdown.as_mut()?.recv().await } => {}
+    }
+}
+
+#[cfg(windows)]
+fn raise_nofile_limit() {}
+
+#[cfg(unix)]
 fn raise_nofile_limit() {
     unsafe {
         let mut lim: libc::rlimit = std::mem::zeroed();

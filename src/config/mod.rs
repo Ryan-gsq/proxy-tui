@@ -426,6 +426,13 @@ impl Config {
                 format!("log.level 只能是 {levels}")
             ));
         }
+        // Rotation is what bounds the log: with 0 it would grow without limit.
+        if self.log.max_size_mb == 0 {
+            bail!(tr!(
+                "log.max_size_mb must be at least 1",
+                "log.max_size_mb 至少为 1"
+            ));
+        }
         for server in &self.dns.servers {
             parse_dns_server(server)?;
         }
@@ -456,9 +463,15 @@ impl Config {
     /// let that owner point it at files elsewhere: certificate, key and log paths
     /// then have to stay inside the data directory.
     pub fn validate_paths(&self, config_path: &Path) -> Result<()> {
-        use std::os::unix::fs::MetadataExt;
         let dir = config_path.parent().unwrap_or(Path::new("."));
-        let delegated = is_root() && std::fs::metadata(dir).is_ok_and(|m| m.uid() != 0);
+        #[cfg(unix)]
+        let delegated = {
+            use std::os::unix::fs::MetadataExt;
+            is_root() && std::fs::metadata(dir).is_ok_and(|m| m.uid() != 0)
+        };
+        // The service runs as LocalSystem on a directory in a user's profile.
+        #[cfg(windows)]
+        let delegated = is_root();
         if !delegated {
             return Ok(());
         }
@@ -775,6 +788,14 @@ mod tests {
             ..settings
         };
         assert_eq!(open.proxy_urls("::1")[0].1, "http://[::1]:7890");
+    }
+
+    #[test]
+    fn log_size_stays_bounded() {
+        let mut cfg = Config::default();
+        assert!(cfg.validate().is_ok());
+        cfg.log.max_size_mb = 0;
+        assert!(cfg.validate().is_err(), "0 would disable rotation");
     }
 
     #[test]

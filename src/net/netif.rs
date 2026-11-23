@@ -1,9 +1,13 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+#[cfg(unix)]
+use std::collections::BTreeMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
+#[cfg(unix)]
 use nix::ifaddrs::getifaddrs;
+#[cfg(unix)]
 use nix::net::if_::{if_nametoindex, InterfaceFlags};
 
 use crate::net::egress;
@@ -211,6 +215,24 @@ async fn probe_iface_v6(iface: &crate::net::netif::Iface) -> bool {
     false
 }
 
+/// Addresses that can carry traffic to the outside.
+fn usable_v4(ip: &Ipv4Addr) -> bool {
+    !(ip.is_loopback() || ip.is_link_local() || ip.is_unspecified())
+}
+
+fn usable_v6(ip: &Ipv6Addr) -> bool {
+    !(ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || ip.is_unicast_link_local()
+        || ip.to_ipv4_mapped().is_some())
+}
+
+fn is_ula(ip: &Ipv6Addr) -> bool {
+    (ip.segments()[0] & 0xfe00) == 0xfc00
+}
+
+#[cfg(unix)]
 pub fn enumerate() -> Vec<Iface> {
     let Ok(addrs) = getifaddrs() else {
         return Vec::new();
@@ -226,18 +248,13 @@ pub fn enumerate() -> Vec<Iface> {
         let Some(addr) = ifa.address else { continue };
         let ip = if let Some(sin) = addr.as_sockaddr_in() {
             let ip = sin.ip();
-            if ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() {
+            if !usable_v4(&ip) {
                 continue;
             }
             IpAddr::V4(ip)
         } else if let Some(sin6) = addr.as_sockaddr_in6() {
             let ip = sin6.ip();
-            if ip.is_loopback()
-                || ip.is_unspecified()
-                || ip.is_multicast()
-                || ip.is_unicast_link_local()
-                || ip.to_ipv4_mapped().is_some()
-            {
+            if !usable_v6(&ip) {
                 continue;
             }
             if let Some(flags) = v6_flags.get(&ip) {
@@ -268,7 +285,7 @@ pub fn enumerate() -> Vec<Iface> {
     let mut out: Vec<Iface> = map.into_values().collect();
     for iface in &mut out {
         iface.v6.sort_by_key(|ip| {
-            let ula = (ip.segments()[0] & 0xfe00) == 0xfc00;
+            let ula = is_ula(ip);
             let temporary = v6_flags
                 .get(ip)
                 .map(|f| f & IFA_F_TEMPORARY != 0)
@@ -279,9 +296,75 @@ pub fn enumerate() -> Vec<Iface> {
     out
 }
 
+/// Up, non-loopback adapters with usable addresses, each with whether it has
+/// an IPv4 / IPv6 default gateway (GetAdaptersAddresses).
+#[cfg(windows)]
+fn adapters() -> Vec<(Iface, bool, bool)> {
+    use ipconfig::{IfType, OperStatus};
+    let Ok(list) = ipconfig::get_adapters() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for adapter in &list {
+        if adapter.oper_status() != OperStatus::IfOperStatusUp
+            || adapter.if_type() == IfType::SoftwareLoopback
+        {
+            continue;
+        }
+        let mut iface = Iface {
+            name: adapter.friendly_name().to_string(),
+            index: adapter.ipv6_if_index(),
+            v4: Vec::new(),
+            v6: Vec::new(),
+            default_v4: false,
+            default_v6: false,
+            v6_ok: false,
+        };
+        for ip in adapter.ip_addresses() {
+            match ip {
+                IpAddr::V4(v4) if usable_v4(v4) && !iface.v4.contains(v4) => iface.v4.push(*v4),
+                IpAddr::V6(v6) if usable_v6(v6) && !iface.v6.contains(v6) => iface.v6.push(*v6),
+                _ => {}
+            }
+        }
+        if iface.v4.is_empty() && iface.v6.is_empty() {
+            continue;
+        }
+        iface.v6.sort_by_key(is_ula);
+        let gateways = adapter.gateways();
+        let gw4 = gateways.iter().any(|g| g.is_ipv4() && !g.is_unspecified());
+        let gw6 = gateways.iter().any(|g| g.is_ipv6() && !g.is_unspecified());
+        out.push((iface, gw4, gw6));
+    }
+    out.sort_by(|a, b| a.0.name.cmp(&b.0.name));
+    out
+}
+
+#[cfg(windows)]
+pub fn enumerate() -> Vec<Iface> {
+    adapters().into_iter().map(|(iface, _, _)| iface).collect()
+}
+
+/// Adapters with a default gateway, per family.
+#[cfg(windows)]
+pub async fn default_route_ifaces() -> Option<(HashSet<String>, HashSet<String>)> {
+    let list = tokio::task::spawn_blocking(adapters).await.ok()?;
+    let names = |pick: fn(&(Iface, bool, bool)) -> bool| {
+        list.iter()
+            .filter(|a| pick(a))
+            .map(|a| a.0.name.clone())
+            .collect::<HashSet<String>>()
+    };
+    Some((names(|a| a.1), names(|a| a.2)))
+}
+
+#[cfg(unix)]
 const IFA_F_TEMPORARY: u32 = 0x01;
+#[cfg(unix)]
 const IFA_F_DADFAILED: u32 = 0x08;
+#[cfg(unix)]
 const IFA_F_DEPRECATED: u32 = 0x20;
+#[cfg(unix)]
 const IFA_F_TENTATIVE: u32 = 0x40;
 
 #[cfg(target_os = "linux")]
@@ -306,11 +389,12 @@ fn ipv6_flags() -> HashMap<Ipv6Addr, u32> {
     out
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn ipv6_flags() -> HashMap<Ipv6Addr, u32> {
     HashMap::new()
 }
 
+#[cfg(unix)]
 async fn command_output(program: &str, args: &[&str]) -> Option<String> {
     let out = tokio::process::Command::new(program)
         .args(args)
@@ -345,7 +429,7 @@ pub async fn default_route_ifaces() -> Option<(HashSet<String>, HashSet<String>)
     Some((devs(&v4), devs(&v6)))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 pub async fn default_route_ifaces() -> Option<(HashSet<String>, HashSet<String>)> {
     let v4 = command_output("netstat", &["-rn", "-f", "inet"]).await?;
     let v6 = command_output("netstat", &["-rn", "-f", "inet6"])
@@ -357,7 +441,7 @@ pub async fn default_route_ifaces() -> Option<(HashSet<String>, HashSet<String>)
 /// Interfaces with a real default route in `netstat -rn` output: a gateway
 /// (`G` flag) that is not a link-local clone (`link#N`, as macOS adds for
 /// bridges such as `bridge100` without any route out).
-#[cfg_attr(target_os = "linux", allow(dead_code))]
+#[cfg_attr(any(target_os = "linux", windows), allow(dead_code))]
 fn bsd_default_devs(text: &str) -> HashSet<String> {
     text.lines()
         .filter_map(|line| {
