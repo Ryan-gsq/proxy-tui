@@ -1,6 +1,6 @@
 [package]
 name = "proxy-tui"
-version = "0.1.0"
+version = "1.1.0"
 edition = "2021"
 description = "High-throughput HTTP/HTTPS/SOCKS5 mixed-port proxy with per-interface egress and a TUI"
 license = "MIT"
