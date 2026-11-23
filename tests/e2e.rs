@@ -566,11 +566,17 @@ async fn oneshot_daemon_restarts_in_process() {
     let config = env.dir.join("config.toml");
     let sock = env.dir.join("control.sock");
     env.daemon.take().unwrap().shutdown().await;
+    let reachable = with_manager(&env.dir, |m| m.status().is_ok()).await;
+    assert!(!reachable, "control channel closed");
+    #[cfg(unix)]
     assert!(!sock.exists());
 
     let again = daemon::start(config, sock.clone(), RunMode::Oneshot, false)
         .await
         .unwrap();
+    let reachable = with_manager(&env.dir, |m| m.status().is_ok()).await;
+    assert!(reachable, "control channel back");
+    #[cfg(unix)]
     assert!(sock.exists());
     let addr = *again
         .listening()

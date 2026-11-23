@@ -1,5 +1,8 @@
 //! Unix：所有访问都从目录 fd 出发（openat 系列），不跟随软链接。
 
+// `mode_t` is u16 on macOS and u32 on Linux: the casts are needed on one of them.
+#![allow(clippy::unnecessary_cast)]
+
 use std::collections::VecDeque;
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::File;
